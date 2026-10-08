@@ -190,6 +190,44 @@ export function FeedView({
     }
   }, [token, prependInstant, refreshBatches]);
 
+  // Single step forward: fetch the batch after the bottom one (possibly
+  // empty — skipped batches still advance the pointer). Returns whether we
+  // moved. Errors propagate so callers can back off.
+  const stepNextBatch = React.useCallback(async (): Promise<boolean> => {
+    if (!token) return false;
+    const list = batchesRef.current;
+    const bottom = bottomBatch.current;
+    if (bottom === null) return false;
+    const idx = list.indexOf(bottom);
+    if (idx === -1 || idx + 1 >= list.length) return false;
+    const res = await getFeedBatch(token, list[idx + 1]);
+    if (!res.complete) return false;
+    bottomBatch.current = list[idx + 1];
+    if (res.posts.length > 0) enqueueReveal(res.posts);
+    return true;
+  }, [token, enqueueReveal]);
+
+  // Walk forward to the newest batch (bounded): one seal tick can cover
+  // several missed windows (sleep, reconnect gap), and a single step would
+  // strand the edge with no further trigger on a short page.
+  const catchUpToEdge = React.useCallback(async () => {
+    if (!token || bottomBatch.current === null || loadingBottom.current) return;
+    loadingBottom.current = true;
+    try {
+      await refreshBatches();
+      for (let i = 0; i < 5; i++) {
+        const list = batchesRef.current;
+        if (list.length === 0) break;
+        if (bottomBatch.current === list[list.length - 1]) break;
+        if (!(await stepNextBatch())) break;
+      }
+    } catch {
+      // Next tick / scroll / focus retries.
+    } finally {
+      loadingBottom.current = false;
+    }
+  }, [token, refreshBatches, stepNextBatch]);
+
   // Newer batch below. Bootstrap starts at n-2 (clamped to oldest), so the
   // user gets two batches of context before the live edge. Withheld (open)
   // windows -> quiet cooldown; the seal tick wakes the live edge.
@@ -264,16 +302,9 @@ export function FeedView({
           return;
         }
       }
-      for (let hops = 0; hops < 12 && idx + 1 < list.length; hops++) {
-        idx += 1;
-        const res = await getFeedBatch(token, list[idx]);
-        if (!res.complete) break;
-        bottomBatch.current = list[idx];
-        if (res.posts.length > 0) {
-          enqueueReveal(res.posts);
-          break;
-        }
-      }
+      // One step; multi-batch catch-up lives in catchUpToEdge (tick /
+      // reconnect / focus), and scrolling itself refires this.
+      await stepNextBatch();
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
         logout().catch(() => {});
@@ -289,7 +320,7 @@ export function FeedView({
     } finally {
       loadingBottom.current = false;
     }
-  }, [token, enqueueReveal, scheduleRetry, refreshBatches]);
+  }, [token, enqueueReveal, scheduleRetry, refreshBatches, stepNextBatch]);
   React.useEffect(() => {
     loadNextBatchRef.current = loadNextBatch;
   });
@@ -326,8 +357,9 @@ export function FeedView({
     bottomBatch.current = snapDown(batchOf(cur[cur.length - 1].created_at));
   }, [token, refreshBatches]);
 
-  // A window sealed while we watch: refresh the list and auto-advance only
-  // if the user is sitting at the live edge (history readers keep reading).
+  // A window sealed while we watch: refresh the list and walk to the edge —
+  // but only if the user is sitting at the live edge (history readers keep
+  // reading; the bottom sentinel serves them when they scroll down).
   const onBatchSealed = React.useCallback(async () => {
     if (!token || bottomBatch.current === null) return;
     const prev = batchesRef.current;
@@ -337,10 +369,19 @@ export function FeedView({
     } catch {
       return;
     }
-    if (bottomBatch.current === prevLatest) {
-      loadNextBatch();
-    }
-  }, [token, refreshBatches, loadNextBatch]);
+    if (bottomBatch.current !== prevLatest) return;
+    catchUpToEdge();
+  }, [token, refreshBatches, catchUpToEdge]);
+
+  // Reconnect / refocus wakes the edge too (covers sleep and missed ticks).
+  React.useEffect(() => {
+    if (!token) return;
+    const onFocus = () => {
+      catchUpToEdge();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [token, catchUpToEdge]);
 
   React.useEffect(() => {
     if (!token) return;
@@ -405,6 +446,8 @@ export function FeedView({
         case "welcome": {
           const online = Array.isArray(pl.online) ? pl.online.length : 0;
           onOnlineCount(online);
+          // (Re)connected: pull anything sealed while we were away.
+          catchUpToEdge();
           break;
         }
         case "presence:online":
