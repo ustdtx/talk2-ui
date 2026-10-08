@@ -188,7 +188,8 @@ export function FeedView({
           scheduleRetry(() => loadNextBatchRef.current(), 8000);
           return;
         }
-        const start = list[Math.max(0, list.length - 3)];
+        const startIdx = Math.max(0, list.length - 3);
+        const start = list[startIdx];
         const res = await getFeedBatch(token, start);
         if (!res.complete) {
           scheduleRetry(() => loadNextBatchRef.current(), 8000);
@@ -197,7 +198,32 @@ export function FeedView({
         topBatch.current = start;
         bottomBatch.current = start;
         loadedOnce.current = true;
-        enqueueReveal(res.posts);
+        // Catch up to the live edge instantly (bounded): bootstrap loads
+        // n-2 for context, then pulls every batch after it below, so a
+        // refresh never strands new posts out of view.
+        const takeFresh = (batch: Post[]) => {
+          const fresh = batch.filter((p) => !seen.current.has(p.id));
+          fresh.forEach((p) => seen.current.add(p.id));
+          return fresh;
+        };
+        const first = takeFresh(res.posts);
+        if (first.length > 0) setPosts((prev) => [...prev, ...first]);
+        let idx = startIdx;
+        for (let hops = 0; hops < 10 && idx + 1 < list.length; hops++) {
+          idx += 1;
+          const r = await getFeedBatch(token, list[idx]);
+          if (!r.complete) break;
+          bottomBatch.current = list[idx];
+          const fresh = takeFresh(r.posts);
+          if (fresh.length > 0) setPosts((prev) => [...prev, ...fresh]);
+          if (postsRef.current.length + revealQueue.current.length > 150) break;
+        }
+        // Settle at the bottom (newest) unless the user already scrolled.
+        requestAnimationFrame(() =>
+          requestAnimationFrame(() => {
+            if (window.scrollY < 200) window.scrollTo(0, document.documentElement.scrollHeight);
+          }),
+        );
         return;
       }
       let list = batchesRef.current;
