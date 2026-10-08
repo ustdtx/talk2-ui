@@ -45,6 +45,14 @@ export function Comments({
     if (open) load();
   }, [open, load]);
 
+  // Pull-based threads: poll while open (no comment:new socket storm).
+  // Retracts still arrive instantly via useThreadEvents below.
+  React.useEffect(() => {
+    if (!open) return;
+    const timer = setInterval(() => load(), 10_000);
+    return () => clearInterval(timer);
+  }, [open, load]);
+
   useThreadEvents(
     postId,
     React.useCallback(() => load(), [load]),

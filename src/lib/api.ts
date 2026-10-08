@@ -72,9 +72,35 @@ export function logout(token: string) {
   return request<{ status: string }>("/auth/logout", token, { method: "POST" });
 }
 
+// Scroll batches: sealed time windows. batch=n returns that window's posts
+// (oldest-first); batch="latest" resolves to the newest sealed batch.
+// The open (still-filling) window comes back as {posts: [], complete: false}
+// — wait for the seal tick instead of showing a partial batch.
+export interface FeedBatch {
+  posts: Post[];
+  batch: number;
+  complete: boolean;
+}
+
+export function getFeedBatch(token: string, batch: number | "latest") {
+  return request<FeedBatch>(`/feed?batch=${batch}`, token);
+}
+
+// Existing sealed, non-empty batch ids ascending. Empty windows create
+// nothing; fully-dead windows (0 live entries) drop out.
+export function listFeedBatches(token: string) {
+  return request<{ batches: number[] }>(`/feed/batches`, token);
+}
+
 export function getFeed(token: string, limit = 50, before?: number) {
   const q = before ? `/feed?limit=${limit}&before=${before}` : `/feed?limit=${limit}`;
   return request<{ posts: Post[] }>(q, token);
+}
+
+// Scroll batch: posts that came after `after` (oldest-first). Client sends
+// the newest id it has; server returns what came after it.
+export function getFeedAfter(token: string, after: number, limit = 20) {
+  return request<{ posts: Post[] }>(`/feed?limit=${limit}&after=${after}`, token);
 }
 
 export function deletePost(token: string, postId: number) {
