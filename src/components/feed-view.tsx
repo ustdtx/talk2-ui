@@ -123,6 +123,23 @@ export function FeedView({
     if (batch.length > 0) revealQueue.current.push(...batch);
   }, []);
 
+  // Retracts/offline must hit every batch, not just rendered posts: drop
+  // matching entries still waiting in the reveal queue so a deleted post
+  // never cascades in after its retract arrived.
+  const purgeQueueById = React.useCallback((id: number) => {
+    const q = revealQueue.current;
+    for (let i = q.length - 1; i >= 0; i--) {
+      if (q[i].id === id) q.splice(i, 1);
+    }
+  }, []);
+
+  const purgeQueueByAuthor = React.useCallback((uid: number) => {
+    const q = revealQueue.current;
+    for (let i = q.length - 1; i >= 0; i--) {
+      if (q[i].author_id === uid) q.splice(i, 1);
+    }
+  }, []);
+
   const scheduleRetry = React.useCallback((fn: () => void, ms: number) => {
     if (retryTimer.current) clearTimeout(retryTimer.current);
     retryTimer.current = setTimeout(fn, ms);
@@ -410,6 +427,9 @@ export function FeedView({
         case "comment:retracted": {
           const pid = pl.post_id as number;
           if (typeof pid === "number") {
+            for (const p of revealQueue.current) {
+              if (p.id === pid) p.comment_count = Math.max(0, (p.comment_count ?? 1) - 1);
+            }
             setPosts((prev) =>
               prev.map((p) =>
                 p.id === pid
@@ -424,11 +444,13 @@ export function FeedView({
         case "post:retracted": {
           const pid = pl.post_id as number;
           seen.current.delete(pid);
+          purgeQueueById(pid);
           setPosts((prev) => prev.filter((p) => p.id !== pid));
           break;
         }
         case "presence:offline": {
           const uid = pl.user_id as number;
+          purgeQueueByAuthor(uid);
           setPosts((prev) => prev.filter((p) => p.author_id !== uid));
           refreshOnline();
           break;
