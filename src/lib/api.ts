@@ -164,8 +164,11 @@ export function uploadImage(token: string, key: string, file: File) {
   });
 }
 
-export function wsUrl(token: string) {
-  return `${API_URL.replace(/^http/, "ws")}/ws?token=${encodeURIComponent(token)}`;
+export function wsUrl() {
+  // Token is no longer embedded: the socket client offers it via the
+  // Sec-WebSocket-Protocol header (see lib/socket.ts) so it never lands in
+  // logs/history. Kept for callers that only need the endpoint.
+  return `${API_URL.replace(/^http/, "ws")}/ws`;
 }
 
 // --- Presence (plan F2) ---
@@ -239,6 +242,7 @@ export interface RoomMessage {
   author_id: number;
   author_username: string;
   text: string;
+  images: PostImage[];
   created_at: string;
 }
 
@@ -261,10 +265,14 @@ export function getRoomMessages(token: string, roomId: number) {
   return request<{ messages: RoomMessage[] }>(`/rooms/${roomId}/messages`, token);
 }
 
-export function sendRoomMessage(token: string, roomId: number, text: string) {
+export function sendRoomMessage(
+  token: string,
+  roomId: number,
+  body: { text: string; image_keys?: string[] },
+) {
   return request<RoomMessage>(`/rooms/${roomId}/messages`, token, {
     method: "POST",
-    body: JSON.stringify({ text }),
+    body: JSON.stringify(body),
   });
 }
 
