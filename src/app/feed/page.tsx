@@ -126,7 +126,9 @@ export default function FeedPage() {
           </Button>
         ))}
       </nav>
-      {tab === "feed" && <FeedView onOnlineCount={setOnline} incoming={incoming} />}
+      {/* Remount on account switch: the feed holds other users' ephemeral
+          content, so a new login must never inherit the previous store. */}
+      {tab === "feed" && <FeedView key={token ?? "anon"} onOnlineCount={setOnline} incoming={incoming} />}
       {tab === "talk" && <DMs target={talkTarget} />}
       {tab === "rooms" && <Rooms />}
     </div>
