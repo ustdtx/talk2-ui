@@ -80,133 +80,21 @@ export function FeedView({
     setPosts((prev) => [...fresh, ...prev]);
   }, []);
 
-  // Realtime reveal queue: every socket-pushed post lands here and the
-  // device drains it at its own pace — a push is never a render.
-  // CPU safety (a 100-posts/sec storm must not pin a phone at 100%):
-  //   - one setPosts per tick (never per post), hard 8ms time budget
-  //   - adaptive rate: AIMD on measured tick cost (1..8 posts/tick)
-  //   - input yield: skip the tick when a tap/scroll is pending, so the
-  //     app shell, app switches and gestures always win over chat render
-  //   - hidden tabs accumulate without rendering (cap enforced)
-  //   - queue cap 300 + overflow pill; drops are backfilled by the next
-  //     catch-up sweep (reconnect / refocus / pill tap)
-  const revealQueue = React.useRef<Post[]>([]);
-  const rateRef = React.useRef(2);
-  const droppedRef = React.useRef(0);
-  const nearBottomRef = React.useRef(true);
-  const [pendingCount, setPendingCount] = React.useState(0);
-  // Mirror of pendingCount for the interval closure (avoids stale reads).
-  const pendingRef = React.useRef(0);
-  const setPending = React.useCallback((n: number) => {
-    if (pendingRef.current !== n) {
-      pendingRef.current = n;
-      setPendingCount(n);
-    }
-  }, []);
-  const QUEUE_CAP = 300;
-  const TICK_MS = 45;
-  const TIME_BUDGET_MS = 8;
-  // Store cap, not a DOM cap: the WindowVirtualizer below mounts only the
-  // visible window (~dozens of cards), so the array can hold far more.
-  // ~2000 text posts ≈ 2MB; images stay URLs until their row mounts.
-  // Eviction is edge-only (history readers never lose rows) and lossless
-  // (evicted ranges refetch via the before-cursor).
-  const STORE_CAP = 2000;
+  // POC snappy: push === render. No paced queue, no AIMD, no caps.
+  // Every socket post appends instantly; retracts filter instantly.
 
-  React.useEffect(() => {
-    const onScroll = () => {
-      const doc = document.documentElement;
-      nearBottomRef.current =
-        doc.scrollHeight - window.scrollY - window.innerHeight < 1000;
-    };
-    onScroll();
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
+  const enqueueReveal = React.useCallback((batch: Post[]) => {
+    const fresh = batch.filter((p) => !seen.current.has(p.id));
+    if (fresh.length === 0) return;
+    fresh.forEach((p) => seen.current.add(p.id));
+    setPosts((prev) => [...prev, ...fresh].sort((a, b) => a.id - b.id));
   }, []);
 
-  React.useEffect(() => {
-    const t = setInterval(() => {
-      const q = revealQueue.current;
-      if (q.length === 0 && droppedRef.current === 0) {
-        setPending(0);
-        return;
-      }
-      // Let user input / compositor win: skip this tick entirely.
-      const sched = (
-        navigator as Navigator & {
-          scheduling?: { isInputPending?: () => boolean };
-        }
-      ).scheduling;
-      if (sched?.isInputPending?.()) return;
-      if (document.hidden) {
-        // No rendering while hidden — just enforce the cap.
-        if (q.length > QUEUE_CAP) {
-          droppedRef.current += q.length - QUEUE_CAP;
-          revealQueue.current = q.slice(-QUEUE_CAP);
-        }
-        const waiting = revealQueue.current.length + droppedRef.current;
-        setPending(waiting);
-        return;
-      }
-      const start = performance.now();
-      const fresh: Post[] = [];
-      const rate = rateRef.current;
-      while (fresh.length < rate && q.length > 0) {
-        if (performance.now() - start > TIME_BUDGET_MS) break;
-        const p = q.shift()!;
-        if (seen.current.has(p.id)) continue;
-        seen.current.add(p.id);
-        fresh.push(p);
-      }
-      // AIMD on measured cost: slow tick -> halve, fast tick -> +1.
-      const cost = performance.now() - start;
-      if (cost > 10) rateRef.current = Math.max(1, Math.floor(rate / 2));
-      else if (cost < 6 && q.length > 10)
-        rateRef.current = Math.min(8, rate + 1);
-      if (fresh.length > 0) {
-        const atEdge = nearBottomRef.current;
-        setPosts((prev) => {
-          const next = [...prev, ...fresh];
-          if (atEdge && next.length > STORE_CAP) {
-            return next.slice(next.length - STORE_CAP);
-          }
-          return next;
-        });
-      }
-      const waiting = q.length + droppedRef.current;
-      setPending(waiting);
-    }, TICK_MS);
-    return () => clearInterval(t);
-  }, [setPending]);
-
-  const enqueueReveal = React.useCallback(
-    (batch: Post[]) => {
-      if (batch.length === 0) return;
-      const q = revealQueue.current;
-      q.push(...batch);
-      if (q.length > QUEUE_CAP) {
-        droppedRef.current += q.length - QUEUE_CAP;
-        revealQueue.current = q.slice(-QUEUE_CAP);
-      }
-    },
-    [QUEUE_CAP],
-  );
-
-  // Retracts/offline must hit the queue too, so a deleted post never
-  // cascades in after its retract arrived.
-  const purgeQueueById = React.useCallback((id: number) => {
-    const q = revealQueue.current;
-    for (let i = q.length - 1; i >= 0; i--) {
-      if (q[i].id === id) q.splice(i, 1);
-    }
-  }, []);
-
-  const purgeQueueByAuthor = React.useCallback((uid: number) => {
-    const q = revealQueue.current;
-    for (let i = q.length - 1; i >= 0; i--) {
-      if (q[i].author_id === uid) q.splice(i, 1);
-    }
-  }, []);
+  // No queue anymore — retracts only touch rendered posts.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const purgeQueueById = React.useCallback((_id?: number) => {}, []);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const purgeQueueByAuthor = React.useCallback((_uid?: number) => {}, []);
 
   // Bootstrap: newest page, oldest-first into the store. Idempotent
   // (seen-filtered), so reconnects can safely rerun it when empty.
@@ -352,9 +240,6 @@ export function FeedView({
     seen.current = new Set<number>();
     topArmed.current = false;
     exhaustedRef.current = false;
-    revealQueue.current = [];
-    droppedRef.current = 0;
-    setPending(0);
     bootstrap();
     let alive = true;
     const socket = new Talk2Socket(() => token);
@@ -382,8 +267,7 @@ export function FeedView({
         case "presence:update":
           refreshOnline();
           break;
-        // Live push: every new post arrives here and waits in the paced
-        // reveal queue above — pushes never render directly.
+        // Live push: POC snappy — render instantly.
         case "feed:new_post": {
           const post = pl as unknown as Post;
           if (
@@ -414,9 +298,6 @@ export function FeedView({
         case "comment:retracted": {
           const pid = pl.post_id as number;
           if (typeof pid === "number") {
-            for (const p of revealQueue.current) {
-              if (p.id === pid) p.comment_count = Math.max(0, (p.comment_count ?? 1) - 1);
-            }
             setPosts((prev) =>
               prev.map((p) =>
                 p.id === pid
@@ -475,21 +356,6 @@ export function FeedView({
             </div>
           ))}
         </WindowVirtualizer>
-        {pendingCount > 3 && (
-          <button
-            type="button"
-            onClick={() => {
-              droppedRef.current = 0;
-              catchUp();
-              virtRef.current?.scrollToIndex(Math.max(0, posts.length - 1), {
-                align: "end",
-              });
-            }}
-            className="bg-primary text-primary-foreground sticky bottom-4 self-center rounded-full px-4 py-1.5 text-xs font-semibold shadow-lg"
-          >
-            ↓ {pendingCount} new — jump to live
-          </button>
-        )}
         {posts.length === 0 && (
           <p className="text-muted-foreground py-12 text-center text-sm">
             The stream is silent. Say something — it only lives while you do.

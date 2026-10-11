@@ -177,10 +177,17 @@ export function DMs({ target }: { target?: { id: number; username: string } | nu
     const off = socket.on((ev) => {
       const pl = (ev.payload ?? {}) as Record<string, unknown>;
       if (ev.type === "dm:receive" || ev.type === "dm:new") {
+        // POC snappy: render the pushed message instantly, refresh list in bg.
+        const msg = pl as unknown as DMMessage;
+        if (active && typeof msg?.id === "number" &&
+          (msg.from_id === active.with_user_id || msg.to_id === active.with_user_id)) {
+          setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
+        }
         loadThreads();
         const from = pl.from_id as number;
         const to = pl.to_id as number;
         if (active && (from === active.with_user_id || to === active.with_user_id)) {
+          // Already appended above; background refresh just reconciles.
           loadMessages(active.with_user_id);
         } else if (typeof from === "number" && user && from !== user.id) {
           // Message for a thread we're not viewing: bold it in the list.
@@ -222,13 +229,15 @@ export function DMs({ target }: { target?: { id: number; username: string } | nu
         await uploadImage(token, key, p.file);
         keys.push(key);
       }
-      await sendDM(token, { to_user_id: active.with_user_id, text, image_keys: keys });
+      const sent = await sendDM(token, { to_user_id: active.with_user_id, text, image_keys: keys });
+      // POC snappy: show own message instantly (single REST RTT), reconcile in bg.
+      setMessages((prev) => (prev.some((m) => m.id === sent.id) ? prev : [...prev, sent]));
       picks.forEach((p) => URL.revokeObjectURL(p.preview));
       setPicks([]);
       setDraft("");
       setError(null);
-      await loadThreads();
-      await loadMessages(active.with_user_id);
+      loadThreads();
+      loadMessages(active.with_user_id);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "could not send (are they still online?)");
     } finally {
