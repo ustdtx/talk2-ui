@@ -272,7 +272,15 @@ export function DMs({ target }: { target?: { id: number; username: string } | nu
                       : "bg-muted self-start rounded-bl-sm"
                   }`}
                 >
-                  {m.text !== "" && <span>{m.text}</span>}
+                  {m.text !== "" ? (
+                    <span>{m.text}</span>
+                  ) : (
+                    (m.images ?? []).length > 0 && (
+                      <span className="italic opacity-70">
+                        {mine ? "You sent an image" : `@${m.from_username} sent an image`}
+                      </span>
+                    )
+                  )}
                   {(m.images ?? []).length > 0 && (
                     <span className={`mt-1 grid gap-1 ${(m.images ?? []).length > 1 ? "grid-cols-2" : "grid-cols-1"}`}>
                       {(m.images ?? []).map((im) => (
@@ -384,7 +392,7 @@ export function DMs({ target }: { target?: { id: number; username: string } | nu
               <span
                 className={`block truncate text-sm ${isUnread ? "font-bold" : "text-muted-foreground"}`}
               >
-                {t.last_text}
+                {t.last_text !== "" ? t.last_text : "📷 sent an image"}
               </span>
             </button>
           );

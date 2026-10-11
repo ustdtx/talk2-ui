@@ -216,7 +216,15 @@ export function Rooms() {
                 return (
                   <div key={message.id} className={`max-w-[80%] rounded-2xl px-3 py-1.5 text-sm ${mine ? "self-end rounded-br-sm bg-primary text-primary-foreground" : "self-start rounded-bl-sm bg-muted"}`}>
                     {!mine && <span className="mb-0.5 block text-[10px] font-semibold opacity-70">@{message.author_username}</span>}
-                    {message.text !== "" && <span className="whitespace-pre-wrap">{message.text}</span>}
+                    {message.text !== "" ? (
+                      <span className="whitespace-pre-wrap">{message.text}</span>
+                    ) : (
+                      (message.images ?? []).length > 0 && (
+                        <span className="italic opacity-70">
+                          {mine ? "You sent an image" : `@${message.author_username} sent an image`}
+                        </span>
+                      )
+                    )}
                     {(message.images ?? []).length > 0 && (
                       <span className={`mt-1 grid gap-1 ${(message.images ?? []).length > 1 ? "grid-cols-2" : "grid-cols-1"}`}>
                         {(message.images ?? []).map((im) => (
