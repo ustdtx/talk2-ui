@@ -164,8 +164,11 @@ export function uploadImage(token: string, key: string, file: File) {
   });
 }
 
-export function wsUrl(token: string) {
-  return `${API_URL.replace(/^http/, "ws")}/ws?token=${encodeURIComponent(token)}`;
+export function wsUrl(_token: string) {
+  // Token is no longer embedded: the socket client offers it via the
+  // Sec-WebSocket-Protocol header (see lib/socket.ts) so it never lands in
+  // logs/history. Kept for callers that only need the endpoint.
+  return `${API_URL.replace(/^http/, "ws")}/ws`;
 }
 
 // --- Presence (plan F2) ---

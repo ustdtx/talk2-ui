@@ -30,10 +30,12 @@ export class Talk2Socket {
   private open() {
     const token = this.getToken();
     if (!token) return;
+    // Token rides the Sec-WebSocket-Protocol header ("bearer.<jwt>"), never
+    // the URL: query params land in server access logs, proxies, and history.
     const wsUrl = `${(
       process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8081"
-    ).replace(/^http/, "ws")}/ws?token=${encodeURIComponent(token)}`;
-    const ws = new WebSocket(wsUrl);
+    ).replace(/^http/, "ws")}/ws`;
+    const ws = new WebSocket(wsUrl, [`bearer.${token}`]);
     this.ws = ws;
 
     ws.onopen = () => {
