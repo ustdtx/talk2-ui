@@ -30,14 +30,14 @@ export class Talk2Socket {
   private open() {
     const token = this.getToken();
     if (!token) return;
-    // Token rides both the Sec-WebSocket-Protocol header ("bearer.<jwt>")
-    // and the ?token= query. The server prefers the subprotocol, but some
-    // proxies (Render) strip it on the WS upgrade — without the query
-    // fallback every socket 401s and the app loses all live updates.
+    // Token rides the ?token= query. The Sec-WebSocket-Protocol route
+    // ("bearer.<jwt>") does NOT survive Render: any upgrade offering a
+    // subprotocol is killed by the proxy (401) even when the query token
+    // is valid — verified live, so the subprotocol offer must stay off.
     const wsUrl = `${(
       process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8081"
     ).replace(/^http/, "ws")}/ws?token=${encodeURIComponent(token)}`;
-    const ws = new WebSocket(wsUrl, [`bearer.${token}`]);
+    const ws = new WebSocket(wsUrl);
     this.ws = ws;
 
     ws.onopen = () => {
