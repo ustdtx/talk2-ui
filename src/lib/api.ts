@@ -164,7 +164,7 @@ export function uploadImage(token: string, key: string, file: File) {
   });
 }
 
-export function wsUrl(_token: string) {
+export function wsUrl() {
   // Token is no longer embedded: the socket client offers it via the
   // Sec-WebSocket-Protocol header (see lib/socket.ts) so it never lands in
   // logs/history. Kept for callers that only need the endpoint.

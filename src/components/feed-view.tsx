@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { WindowVirtualizer, type WindowVirtualizerHandle } from "virtua";
 import { ApiError, getFeedBatch, getOnline, listFeedBatches, type Post } from "@/lib/api";
 import { Talk2Socket, type SocketEvent } from "@/lib/socket";
 import { useSession } from "@/context/session";
@@ -73,24 +74,20 @@ export function FeedView({
   const retryTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const topRef = React.useRef<HTMLDivElement>(null);
   const bottomRef = React.useRef<HTMLDivElement>(null);
+  const virtRef = React.useRef<WindowVirtualizerHandle>(null);
   const topArmed = React.useRef(false);
   const loadedOnce = React.useRef(false);
 
   // Instant prepend for history batches (above) with scroll restoration,
   // so the post you were reading stays exactly where it was.
+  // The WindowVirtualizer's `shift` prop owns the compensation (it adjusts
+  // scrollTop by the measured height of prepended rows), so this is a plain
+  // prepend — no manual scrollHeight juggling that would double-compensate.
   const prependInstant = React.useCallback((batch: Post[]) => {
     const fresh = batch.filter((p) => !seen.current.has(p.id));
     if (fresh.length === 0) return;
     fresh.forEach((p) => seen.current.add(p.id));
-    const prevTop = window.scrollY;
-    const prevHeight = document.documentElement.scrollHeight;
     setPosts((prev) => [...fresh, ...prev]);
-    requestAnimationFrame(() =>
-      requestAnimationFrame(() => {
-        const dh = document.documentElement.scrollHeight - prevHeight;
-        if (dh > 0) window.scrollTo(0, prevTop + dh);
-      }),
-    );
   }, []);
 
   // Realtime reveal queue: every socket-pushed post lands here and the
@@ -121,7 +118,12 @@ export function FeedView({
   const QUEUE_CAP = 300;
   const TICK_MS = 45;
   const TIME_BUDGET_MS = 8;
-  const MAX_RENDERED = 300;
+  // Store cap, not a DOM cap: the WindowVirtualizer below mounts only the
+  // visible window (~dozens of cards), so the array can hold far more than
+  // the old 300-rendered limit. ~2000 text posts ≈ 2MB; images stay URLs
+  // until their row mounts. Eviction is edge-only (history readers never
+  // lose rows) and lossless (evicted batches refetch by batch number).
+  const STORE_CAP = 2000;
 
   React.useEffect(() => {
     const onScroll = () => {
@@ -177,8 +179,8 @@ export function FeedView({
         const atEdge = nearBottomRef.current;
         setPosts((prev) => {
           const next = [...prev, ...fresh];
-          if (atEdge && next.length > MAX_RENDERED) {
-            return next.slice(next.length - MAX_RENDERED);
+          if (atEdge && next.length > STORE_CAP) {
+            return next.slice(next.length - STORE_CAP);
           }
           return next;
         });
@@ -350,7 +352,9 @@ export function FeedView({
           bottomBatch.current = list[idx];
           const fresh = takeFresh(r.posts);
           if (fresh.length > 0) setPosts((prev) => [...prev, ...fresh]);
-          if (postsRef.current.length + revealQueue.current.length > 150) break;
+          // Bootstrap is data-only (the virtualizer mounts just the window),
+          // so the cap is store-sized, not render-sized.
+          if (postsRef.current.length + revealQueue.current.length > 1000) break;
         }
         // Settle at the bottom (newest) unless the user already scrolled.
         requestAnimationFrame(() =>
@@ -612,18 +616,26 @@ export function FeedView({
       {loadingOlder && (
         <p className="text-muted-foreground self-center text-xs">loading older…</p>
       )}
-      {posts.map((p) => (
-        <PostCard key={p.id} post={p} />
-      ))}
+      {/* Windowed rendering: only the visible window mounts (~dozens of
+          cards no matter how deep the store grows). `shift` keeps the read
+          position stable when history prepends above; stable post-id keys
+          are required for it (never indices). Spacing lives on the item
+          wrapper (parent gap can't reach inside the virtual container). */}
+      <WindowVirtualizer ref={virtRef} shift>
+        {posts.map((p) => (
+          <div key={p.id} className="pb-4">
+            <PostCard post={p} />
+          </div>
+        ))}
+      </WindowVirtualizer>
       {pendingCount > 3 && (
         <button
           type="button"
           onClick={() => {
             droppedRef.current = 0;
             setPending(revealQueue.current.length);
-            bottomRef.current?.scrollIntoView({
-              behavior: "smooth",
-              block: "end",
+            virtRef.current?.scrollToIndex(Math.max(0, posts.length - 1), {
+              align: "end",
             });
           }}
           className="bg-primary text-primary-foreground sticky bottom-4 self-center rounded-full px-4 py-1.5 text-xs font-semibold shadow-lg"
