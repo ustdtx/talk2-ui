@@ -242,6 +242,10 @@ export function FeedView({
 
   // Catch-up: everything newer than our newest id (missed pushes from a
   // disconnect, sleep, or flood overflow). Dedupe via seen ids.
+  // Then reconcile: any missed retract (reconnect gap, dropped push, slow
+  // client) leaves a ghost post nothing will ever remove — refresh was the
+  // only cure. The newest page is ground truth for its window, so prune
+  // locals inside that window that aren't live anymore.
   const catchUp = React.useCallback(async () => {
     if (!token) return;
     const cur = postsRef.current;
@@ -253,9 +257,27 @@ export function FeedView({
       const res = await getFeedAfter(token, cur[cur.length - 1].id, 100);
       enqueueReveal(res.posts);
     } catch {
-      // Sockets keep delivering live; next focus/reconnect retries.
+      // Sockets keep delivering live; next focus retries.
     }
-  }, [token, bootstrap, enqueueReveal]);
+    try {
+      const live = await getFeed(token, 100);
+      if (live.posts.length === 0) return;
+      const ids = new Set(live.posts.map((p) => p.id));
+      const floor = live.posts[live.posts.length - 1].id;
+      const ghosts = new Set<number>();
+      for (const p of postsRef.current) {
+        if (p.id >= floor && !ids.has(p.id)) ghosts.add(p.id);
+      }
+      if (ghosts.size === 0) return;
+      ghosts.forEach((id) => {
+        seen.current.delete(id);
+        purgeQueueById(id);
+      });
+      setPosts((prev) => prev.filter((p) => !ghosts.has(p.id)));
+    } catch {
+      // Next sweep retries.
+    }
+  }, [token, bootstrap, enqueueReveal, purgeQueueById]);
 
   // History: one older page above the current top (reverse scroll).
   const loadOlder = React.useCallback(async () => {
