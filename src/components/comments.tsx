@@ -42,8 +42,9 @@ function CommentImages({ images }: { images: { key: string; url: string }[] }) {
 }
 
 // Live comment thread for one post (plan F4). Top-level oldest-first with
-// one-level replies. Refetches on comment:new / comment:retracted for this
-// post and drops when the post is retracted (parent removes the card).
+// one-level replies. New comments arrive over the socket (comment:new via
+// the feed's thread bus) and refetch instantly; retracts drop the same way.
+// The parent card vanishes via post:retracted when the post is gone.
 export function Comments({
   postId,
   open,
@@ -109,14 +110,8 @@ export function Comments({
     if (open) load();
   }, [open, load]);
 
-  // Pull-based threads: poll while open (no comment:new socket storm).
-  // Retracts still arrive instantly via useThreadEvents below.
-  React.useEffect(() => {
-    if (!open) return;
-    const timer = setInterval(() => load(), 10_000);
-    return () => clearInterval(timer);
-  }, [open, load]);
-
+  // Live updates only — no polling. comment:new / comment:retracted for
+  // this post arrive via the thread bus below.
   useThreadEvents(
     postId,
     React.useCallback(() => load(), [load]),

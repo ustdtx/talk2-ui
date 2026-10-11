@@ -2,13 +2,14 @@
 
 import * as React from "react";
 import { WindowVirtualizer, type WindowVirtualizerHandle } from "virtua";
-import { ApiError, getFeedBatch, getOnline, listFeedBatches, type Post } from "@/lib/api";
+import { ApiError, getFeed, getFeedAfter, getOnline, type Post } from "@/lib/api";
 import { Talk2Socket, type SocketEvent } from "@/lib/socket";
 import { useSession } from "@/context/session";
 import { PostCard } from "@/components/post-card";
 
 // Per-post thread event bus: the shared socket lives here, comment threads
-// in PostCards subscribe for live refetch triggers.
+// in PostCards subscribe for live refetch triggers (comment:new /
+// comment:retracted for their post).
 type ThreadFn = (ev: SocketEvent) => void;
 const ThreadEventsContext = React.createContext<{
   subscribe: (postId: number, fn: ThreadFn) => () => void;
@@ -56,33 +57,22 @@ export function FeedView({
     threadSubs.current.get(postId)?.forEach((fn) => fn(ev));
   }, []);
 
-  // Time-window scroll batches: every sealed window holding posts is a batch.
-  // Fresh users start at n-2 (two batches of context, clamped to oldest).
-  // Scroll down at the bottom -> next batch below; scroll up at the top ->
-  // previous batch above. Open windows are withheld until the seal tick.
-  const batchesRef = React.useRef<number[]>([]);
-  const topBatch = React.useRef<number | null>(null);
-  const bottomBatch = React.useRef<number | null>(null);
+  // Store mirror for cursor reads (newest/oldest id) inside callbacks.
   const postsRef = React.useRef<Post[]>([]);
   React.useEffect(() => {
     postsRef.current = posts;
   }, [posts]);
+
   const [loadingOlder, setLoadingOlder] = React.useState(false);
   const loadingTop = React.useRef(false);
-  const loadingBottom = React.useRef(false);
-  const newerCooldownUntil = React.useRef(0);
-  const retryTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const exhaustedRef = React.useRef(false);
+  const bootInflight = React.useRef(false);
   const topRef = React.useRef<HTMLDivElement>(null);
-  const bottomRef = React.useRef<HTMLDivElement>(null);
   const virtRef = React.useRef<WindowVirtualizerHandle>(null);
   const topArmed = React.useRef(false);
-  const loadedOnce = React.useRef(false);
 
-  // Instant prepend for history batches (above) with scroll restoration,
-  // so the post you were reading stays exactly where it was.
-  // The WindowVirtualizer's `shift` prop owns the compensation (it adjusts
-  // scrollTop by the measured height of prepended rows), so this is a plain
-  // prepend — no manual scrollHeight juggling that would double-compensate.
+  // History prepend. The WindowVirtualizer's `shift` prop owns scroll
+  // compensation, so this is a plain prepend.
   const prependInstant = React.useCallback((batch: Post[]) => {
     const fresh = batch.filter((p) => !seen.current.has(p.id));
     if (fresh.length === 0) return;
@@ -98,10 +88,8 @@ export function FeedView({
   //   - input yield: skip the tick when a tap/scroll is pending, so the
   //     app shell, app switches and gestures always win over chat render
   //   - hidden tabs accumulate without rendering (cap enforced)
-  //   - queue cap 300: beyond that we drop oldest (they arrive later via
-  //     sealed batches) and the overflow pill shows the true waiting count
-  //   - rendered DOM cap 300 (trimmed only while at the live edge, so
-  //     history readers never lose what they're reading)
+  //   - queue cap 300 + overflow pill; drops are backfilled by the next
+  //     catch-up sweep (reconnect / refocus / pill tap)
   const revealQueue = React.useRef<Post[]>([]);
   const rateRef = React.useRef(2);
   const droppedRef = React.useRef(0);
@@ -119,10 +107,10 @@ export function FeedView({
   const TICK_MS = 45;
   const TIME_BUDGET_MS = 8;
   // Store cap, not a DOM cap: the WindowVirtualizer below mounts only the
-  // visible window (~dozens of cards), so the array can hold far more than
-  // the old 300-rendered limit. ~2000 text posts ≈ 2MB; images stay URLs
-  // until their row mounts. Eviction is edge-only (history readers never
-  // lose rows) and lossless (evicted batches refetch by batch number).
+  // visible window (~dozens of cards), so the array can hold far more.
+  // ~2000 text posts ≈ 2MB; images stay URLs until their row mounts.
+  // Eviction is edge-only (history readers never lose rows) and lossless
+  // (evicted ranges refetch via the before-cursor).
   const STORE_CAP = 2000;
 
   React.useEffect(() => {
@@ -204,9 +192,8 @@ export function FeedView({
     [QUEUE_CAP],
   );
 
-  // Retracts/offline must hit every batch, not just rendered posts: drop
-  // matching entries still waiting in the reveal queue so a deleted post
-  // never cascades in after its retract arrived.
+  // Retracts/offline must hit the queue too, so a deleted post never
+  // cascades in after its retract arrived.
   const purgeQueueById = React.useCallback((id: number) => {
     const q = revealQueue.current;
     for (let i = q.length - 1; i >= 0; i--) {
@@ -221,281 +208,115 @@ export function FeedView({
     }
   }, []);
 
-  const scheduleRetry = React.useCallback((fn: () => void, ms: number) => {
-    if (retryTimer.current) clearTimeout(retryTimer.current);
-    retryTimer.current = setTimeout(fn, ms);
-  }, []);
-
-  // Fresh batch list (sealed, non-empty ids ascending).
-  const refreshBatches = React.useCallback(async () => {
-    if (!token) return [];
-    const res = await listFeedBatches(token);
-    batchesRef.current = res.batches;
-    return res.batches;
-  }, [token]);
-
-  // Older batch above (reverse scroll). Skips sealed-but-emptied batches;
-  // re-anchors if our top batch vanished (all its posts died).
-  const loadPreviousBatch = React.useCallback(async () => {
-    if (!token || loadingTop.current || topBatch.current === null) return;
-    loadingTop.current = true;
-    setLoadingOlder(true);
+  // Bootstrap: newest page, oldest-first into the store. Idempotent
+  // (seen-filtered), so reconnects can safely rerun it when empty.
+  const bootstrap = React.useCallback(async () => {
+    if (!token || bootInflight.current) return;
+    bootInflight.current = true;
     try {
-      let list = batchesRef.current;
-      let idx = list.indexOf(topBatch.current);
-      if (idx === -1) {
-        list = await refreshBatches();
-        const cands = list.filter((b) => b <= (topBatch.current as number));
-        if (cands.length === 0) {
-          if (list.length > 0) topBatch.current = list[0];
-          return;
-        }
-        topBatch.current = cands[cands.length - 1];
-        idx = list.indexOf(topBatch.current);
-      }
-      for (let hops = 0; hops < 12 && idx > 0; hops++) {
-        idx -= 1;
-        const res = await getFeedBatch(token, list[idx]);
-        if (!res.complete) break;
-        topBatch.current = list[idx];
-        if (res.posts.length > 0) {
-          prependInstant(res.posts);
-          break;
-        }
-      }
-    } catch {
-      // Sentinel stays armed; scrolling retriggers.
-    } finally {
-      loadingTop.current = false;
-      setLoadingOlder(false);
-    }
-  }, [token, prependInstant, refreshBatches]);
-
-  // Single step forward: fetch the batch after the bottom one (possibly
-  // empty — skipped batches still advance the pointer). Returns whether we
-  // moved. Errors propagate so callers can back off.
-  const stepNextBatch = React.useCallback(async (): Promise<boolean> => {
-    if (!token) return false;
-    const list = batchesRef.current;
-    const bottom = bottomBatch.current;
-    if (bottom === null) return false;
-    const idx = list.indexOf(bottom);
-    if (idx === -1 || idx + 1 >= list.length) return false;
-    const res = await getFeedBatch(token, list[idx + 1]);
-    if (!res.complete) return false;
-    bottomBatch.current = list[idx + 1];
-    if (res.posts.length > 0) enqueueReveal(res.posts);
-    return true;
-  }, [token, enqueueReveal]);
-
-  // Walk forward to the newest batch (bounded): one seal tick can cover
-  // several missed windows (sleep, reconnect gap), and a single step would
-  // strand the edge with no further trigger on a short page.
-  const catchUpToEdge = React.useCallback(async () => {
-    if (!token || bottomBatch.current === null || loadingBottom.current) return;
-    loadingBottom.current = true;
-    try {
-      await refreshBatches();
-      for (let i = 0; i < 5; i++) {
-        const list = batchesRef.current;
-        if (list.length === 0) break;
-        if (bottomBatch.current === list[list.length - 1]) break;
-        if (!(await stepNextBatch())) break;
-      }
-    } catch {
-      // Next tick / scroll / focus retries.
-    } finally {
-      loadingBottom.current = false;
-    }
-  }, [token, refreshBatches, stepNextBatch]);
-
-  // Newer batch below. Bootstrap starts at n-2 (clamped to oldest), so the
-  // user gets two batches of context before the live edge. Withheld (open)
-  // windows -> quiet cooldown; the seal tick wakes the live edge.
-  const loadNextBatchRef = React.useRef<() => void>(() => {});
-  const loadNextBatch = React.useCallback(async () => {
-    if (!token || loadingBottom.current) return;
-    if (Date.now() < newerCooldownUntil.current) return;
-    loadingBottom.current = true;
-    try {
-      if (bottomBatch.current === null) {
-        const list = await refreshBatches();
-        if (list.length === 0) {
-          scheduleRetry(() => loadNextBatchRef.current(), 8000);
-          return;
-        }
-        const startIdx = Math.max(0, list.length - 3);
-        const start = list[startIdx];
-        const res = await getFeedBatch(token, start);
-        if (!res.complete) {
-          scheduleRetry(() => loadNextBatchRef.current(), 8000);
-          return;
-        }
-        topBatch.current = start;
-        bottomBatch.current = start;
-        loadedOnce.current = true;
-        // Catch up to the live edge instantly (bounded): bootstrap loads
-        // n-2 for context, then pulls every batch after it below, so a
-        // refresh never strands new posts out of view.
-        const takeFresh = (batch: Post[]) => {
-          const fresh = batch.filter((p) => !seen.current.has(p.id));
-          fresh.forEach((p) => seen.current.add(p.id));
-          return fresh;
-        };
-        const first = takeFresh(res.posts);
-        if (first.length > 0) setPosts((prev) => [...prev, ...first]);
-        let idx = startIdx;
-        for (let hops = 0; hops < 10 && idx + 1 < list.length; hops++) {
-          idx += 1;
-          const r = await getFeedBatch(token, list[idx]);
-          if (!r.complete) break;
-          bottomBatch.current = list[idx];
-          const fresh = takeFresh(r.posts);
-          if (fresh.length > 0) setPosts((prev) => [...prev, ...fresh]);
-          // Bootstrap is data-only (the virtualizer mounts just the window),
-          // so the cap is store-sized, not render-sized.
-          if (postsRef.current.length + revealQueue.current.length > 1000) break;
-        }
-        // Settle at the bottom (newest) unless the user already scrolled.
+      const res = await getFeed(token, 50);
+      const fresh = [...res.posts]
+        .reverse()
+        .filter((p) => !seen.current.has(p.id));
+      if (fresh.length > 0) {
+        fresh.forEach((p) => seen.current.add(p.id));
+        setPosts((prev) => [...prev, ...fresh].sort((a, b) => a.id - b.id));
         requestAnimationFrame(() =>
           requestAnimationFrame(() => {
-            if (window.scrollY < 200) window.scrollTo(0, document.documentElement.scrollHeight);
+            if (window.scrollY < 200)
+              window.scrollTo(0, document.documentElement.scrollHeight);
           }),
         );
-        return;
       }
-      let list = batchesRef.current;
-      let idx = list.indexOf(bottomBatch.current);
-      if (idx === -1) {
-        // Our bottom batch died off: jump to the live edge.
-        list = await refreshBatches();
-        bottomBatch.current = list.length > 0 ? list[list.length - 1] : null;
-        return;
-      }
-      if (idx + 1 >= list.length) {
-        // At the edge: refresh once in case a seal was missed, else wait.
-        list = await refreshBatches();
-        idx = list.indexOf(bottomBatch.current);
-        if (idx === -1) {
-          bottomBatch.current = list.length > 0 ? list[list.length - 1] : null;
-          return;
-        }
-        if (idx + 1 >= list.length) {
-          newerCooldownUntil.current = Date.now() + 8000;
-          return;
-        }
-      }
-      // One step; multi-batch catch-up lives in catchUpToEdge (tick /
-      // reconnect / focus), and scrolling itself refires this.
-      await stepNextBatch();
+      setError(null);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
         logout().catch(() => {});
         return;
       }
-      if (!loadedOnce.current && bottomBatch.current === null) {
-        setError(e instanceof ApiError ? e.message : "feed failed to load");
-      } else if (bottomBatch.current === null) {
-        scheduleRetry(() => loadNextBatchRef.current(), 8000);
-      } else {
-        newerCooldownUntil.current = Date.now() + 8000;
-      }
+      setError(e instanceof ApiError ? e.message : "feed failed to load");
     } finally {
-      loadingBottom.current = false;
+      bootInflight.current = false;
     }
-  }, [token, enqueueReveal, scheduleRetry, refreshBatches, stepNextBatch]);
-  React.useEffect(() => {
-    loadNextBatchRef.current = loadNextBatch;
-  });
+  }, [token, logout]);
 
-  // Window length changed server-side (crowd grew/shrank): batch numbers
-  // mean new groupings now. Re-anchor from what is actually on screen —
-  // seen-ids dedupe makes the transition lossless (overlap skipped, gaps
-  // fetched by scrolling).
-  const rebaseWindow = React.useCallback(async (windowSec: number) => {
+  // Catch-up: everything newer than our newest id (missed pushes from a
+  // disconnect, sleep, or flood overflow). Dedupe via seen ids.
+  const catchUp = React.useCallback(async () => {
     if (!token) return;
-    let list: number[];
-    try {
-      list = await refreshBatches();
-    } catch {
-      return;
-    }
     const cur = postsRef.current;
-    if (cur.length === 0 || list.length === 0) {
-      topBatch.current = null;
-      bottomBatch.current = null;
+    if (cur.length === 0) {
+      bootstrap();
       return;
     }
-    const wMs = windowSec * 1000;
-    const batchOf = (iso: string) => Math.floor(Date.parse(iso) / wMs);
-    const snapDown = (id: number) => {
-      let best = list[0];
-      for (const b of list) {
-        if (b <= id) best = b;
-        else break;
-      }
-      return best;
-    };
-    topBatch.current = snapDown(batchOf(cur[0].created_at));
-    bottomBatch.current = snapDown(batchOf(cur[cur.length - 1].created_at));
-  }, [token, refreshBatches]);
-
-  // A window sealed while we watch: refresh the list and walk to the edge —
-  // but only if the user is sitting at the live edge (history readers keep
-  // reading; the bottom sentinel serves them when they scroll down).
-  const onBatchSealed = React.useCallback(async () => {
-    if (!token || bottomBatch.current === null) return;
-    const prev = batchesRef.current;
-    const prevLatest = prev.length > 0 ? prev[prev.length - 1] : null;
     try {
-      await refreshBatches();
+      const res = await getFeedAfter(token, cur[cur.length - 1].id, 100);
+      enqueueReveal(res.posts);
     } catch {
-      return;
+      // Sockets keep delivering live; next focus/reconnect retries.
     }
-    if (bottomBatch.current !== prevLatest) return;
-    catchUpToEdge();
-  }, [token, refreshBatches, catchUpToEdge]);
+  }, [token, bootstrap, enqueueReveal]);
 
-  // Reconnect / refocus wakes the edge too (covers sleep and missed ticks).
-  React.useEffect(() => {
-    if (!token) return;
-    const onFocus = () => {
-      catchUpToEdge();
-    };
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
-  }, [token, catchUpToEdge]);
+  // History: one older page above the current top (reverse scroll).
+  const loadOlder = React.useCallback(async () => {
+    if (!token || loadingTop.current || exhaustedRef.current) return;
+    const oldest = postsRef.current[0]?.id;
+    if (!oldest) return;
+    loadingTop.current = true;
+    setLoadingOlder(true);
+    try {
+      const res = await getFeed(token, 50, oldest);
+      if (res.posts.length === 0) {
+        exhaustedRef.current = true;
+        return;
+      }
+      prependInstant([...res.posts].reverse());
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        logout().catch(() => {});
+      }
+      // Sentinel stays armed; scrolling retriggers.
+    } finally {
+      loadingTop.current = false;
+      setLoadingOlder(false);
+    }
+  }, [token, logout, prependInstant]);
 
+  // Top sentinel: reverse scroll loads older. It starts visible, so only
+  // load once the user has scrolled past it and back up.
+  // (Initial load lives in the socket effect below: it bootstraps even if
+  // the socket itself fails, so there is exactly one owner.)
   React.useEffect(() => {
     if (!token) return;
     const topEl = topRef.current;
-    const bottomEl = bottomRef.current;
-    if (!topEl || !bottomEl) return;
+    if (!topEl) return;
     const io = new IntersectionObserver(
       (entries) => {
         for (const e of entries) {
-          if (e.target === topEl) {
-            // The top sentinel starts visible, so only load older once the
-            // user has scrolled past it and back up (reverse scroll).
-            if (!e.isIntersecting) {
-              topArmed.current = true;
-            } else if (topArmed.current) {
-              loadPreviousBatch();
-            }
-          } else if (e.isIntersecting) {
-            loadNextBatch();
+          if (!e.isIntersecting) {
+            topArmed.current = true;
+          } else if (topArmed.current) {
+            loadOlder();
           }
         }
       },
       { rootMargin: "400px" },
     );
     io.observe(topEl);
-    io.observe(bottomEl);
     return () => {
       io.disconnect();
-      if (retryTimer.current) clearTimeout(retryTimer.current);
     };
-  }, [token, loadPreviousBatch, loadNextBatch]);
+  }, [token, loadOlder]);
+
+  // Refocus wakes the edge (covers sleep and missed pushes).
+  React.useEffect(() => {
+    if (!token) return;
+    const onFocus = () => {
+      catchUp();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [token, catchUp]);
 
   // Own new post joins the reveal queue (lands below, one by one).
   React.useEffect(() => {
@@ -504,15 +325,15 @@ export function FeedView({
 
   React.useEffect(() => {
     if (!token) return;
+    // Fresh mount per account (parent keys on token), so all refs start
+    // clean; the guards below are idempotent backstops.
     seen.current = new Set<number>();
-    batchesRef.current = [];
-    topBatch.current = null;
-    bottomBatch.current = null;
     topArmed.current = false;
-    loadedOnce.current = false;
+    exhaustedRef.current = false;
     revealQueue.current = [];
     droppedRef.current = 0;
     setPending(0);
+    bootstrap();
     let alive = true;
     const socket = new Talk2Socket(() => token);
 
@@ -531,8 +352,8 @@ export function FeedView({
         case "welcome": {
           const online = Array.isArray(pl.online) ? pl.online.length : 0;
           onOnlineCount(online);
-          // (Re)connected: pull anything sealed while we were away.
-          catchUpToEdge();
+          // (Re)connected: pull anything posted while we were away.
+          catchUp();
           break;
         }
         case "presence:online":
@@ -540,9 +361,7 @@ export function FeedView({
           refreshOnline();
           break;
         // Live push: every new post arrives here and waits in the paced
-        // reveal queue above — pushes never render directly. Sealed
-        // time-window batches below stay the history + reconnect path
-        // (dedupe via seen ids makes the overlap lossless).
+        // reveal queue above — pushes never render directly.
         case "feed:new_post": {
           const post = pl as unknown as Post;
           if (
@@ -553,13 +372,21 @@ export function FeedView({
           }
           break;
         }
-        case "feed:batch_sealed": {
-          onBatchSealed();
-          break;
-        }
-        case "feed:window_changed": {
-          const w = (pl.window_sec as number) ?? 60;
-          rebaseWindow(typeof w === "number" && w > 0 ? w : 60);
+        // Live threads: wake the open thread for this post; each Comments
+        // box refetches its own page. Closed threads update their count
+        // when next opened.
+        case "comment:new": {
+          const pid = (pl as unknown as { post_id: number }).post_id;
+          if (typeof pid === "number") {
+            setPosts((prev) =>
+              prev.map((p) =>
+                p.id === pid
+                  ? { ...p, comment_count: (p.comment_count ?? 0) + 1 }
+                  : p,
+              ),
+            );
+            notifyThread(pid, ev);
+          }
           break;
         }
         case "comment:retracted": {
@@ -596,9 +423,6 @@ export function FeedView({
       }
     };
 
-    // No initial fetch here: the bottom sentinel bootstraps from the latest
-    // sealed batch (and retries until the first batch exists).
-
     const off = socket.on(handle);
     socket.connect();
     return () => {
@@ -611,44 +435,45 @@ export function FeedView({
 
   if (error) return <p className="text-destructive text-sm">{error}</p>;
   return (
-    <div className="flex flex-col gap-4">
-      <div ref={topRef} />
-      {loadingOlder && (
-        <p className="text-muted-foreground self-center text-xs">loading older…</p>
-      )}
-      {/* Windowed rendering: only the visible window mounts (~dozens of
-          cards no matter how deep the store grows). `shift` keeps the read
-          position stable when history prepends above; stable post-id keys
-          are required for it (never indices). Spacing lives on the item
-          wrapper (parent gap can't reach inside the virtual container). */}
-      <WindowVirtualizer ref={virtRef} shift>
-        {posts.map((p) => (
-          <div key={p.id} className="pb-4">
-            <PostCard post={p} />
-          </div>
-        ))}
-      </WindowVirtualizer>
-      {pendingCount > 3 && (
-        <button
-          type="button"
-          onClick={() => {
-            droppedRef.current = 0;
-            setPending(revealQueue.current.length);
-            virtRef.current?.scrollToIndex(Math.max(0, posts.length - 1), {
-              align: "end",
-            });
-          }}
-          className="bg-primary text-primary-foreground sticky bottom-4 self-center rounded-full px-4 py-1.5 text-xs font-semibold shadow-lg"
-        >
-          ↓ {pendingCount} new — jump to live
-        </button>
-      )}
-      <div ref={bottomRef} />
-      {posts.length === 0 && (
-        <p className="text-muted-foreground py-12 text-center text-sm">
-          The stream is silent. Say something — it only lives while you do.
-        </p>
-      )}
-    </div>
+    <ThreadEventsContext.Provider value={bus}>
+      <div className="flex flex-col gap-4">
+        <div ref={topRef} />
+        {loadingOlder && (
+          <p className="text-muted-foreground self-center text-xs">loading older…</p>
+        )}
+        {/* Windowed rendering: only the visible window mounts (~dozens of
+            cards no matter how deep the store grows). `shift` keeps the read
+            position stable when history prepends above; stable post-id keys
+            are required for it (never indices). Spacing lives on the item
+            wrapper (parent gap can't reach inside the virtual container). */}
+        <WindowVirtualizer ref={virtRef} shift>
+          {posts.map((p) => (
+            <div key={p.id} className="pb-4">
+              <PostCard post={p} />
+            </div>
+          ))}
+        </WindowVirtualizer>
+        {pendingCount > 3 && (
+          <button
+            type="button"
+            onClick={() => {
+              droppedRef.current = 0;
+              catchUp();
+              virtRef.current?.scrollToIndex(Math.max(0, posts.length - 1), {
+                align: "end",
+              });
+            }}
+            className="bg-primary text-primary-foreground sticky bottom-4 self-center rounded-full px-4 py-1.5 text-xs font-semibold shadow-lg"
+          >
+            ↓ {pendingCount} new — jump to live
+          </button>
+        )}
+        {posts.length === 0 && (
+          <p className="text-muted-foreground py-12 text-center text-sm">
+            The stream is silent. Say something — it only lives while you do.
+          </p>
+        )}
+      </div>
+    </ThreadEventsContext.Provider>
   );
 }
