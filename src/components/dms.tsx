@@ -1,12 +1,13 @@
 "use client";
 
 import * as React from "react";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, ImagePlus, X } from "lucide-react";
 import {
   ApiError,
   getDMThread,
   listDMs,
   sendDM,
+  uploadImage,
   type DMMessage,
   type DMThread,
 } from "@/lib/api";
@@ -16,6 +17,19 @@ import { useSession } from "@/context/session";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+
+const MAX_IMAGES = 4;
+
+interface Pick {
+  file: File;
+  preview: string;
+}
+
+function extFor(file: File): string {
+  if (file.type === "image/png") return ".png";
+  if (file.type === "image/webp") return ".webp";
+  return ".jpg";
+}
 
 // Revamped Talk (plan F5): online-only 1:1 chats.
 // List shows username + last message (bold = unread); chat is clean
@@ -29,10 +43,40 @@ export function DMs({ target }: { target?: { id: number; username: string } | nu
   const [messages, setMessages] = React.useState<DMMessage[]>([]);
   const [unread, setUnread] = React.useState<Set<number>>(new Set());
   const [draft, setDraft] = React.useState("");
+  const [picks, setPicks] = React.useState<Pick[]>([]);
   const [error, setError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const cardRef = React.useRef<HTMLDivElement>(null);
+  const fileRef = React.useRef<HTMLInputElement>(null);
+
+  function addFiles(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    const fresh: Pick[] = [];
+    let err: string | null = null;
+    for (const f of files) {
+      if (picks.length + fresh.length >= MAX_IMAGES) break;
+      if (!["image/jpeg", "image/png", "image/webp"].includes(f.type)) {
+        err = "only jpeg, png, webp images allowed";
+        continue;
+      }
+      if (f.size > 5 * 1024 * 1024) {
+        err = "each image must be 5 MB or smaller";
+        continue;
+      }
+      fresh.push({ file: f, preview: URL.createObjectURL(f) });
+    }
+    if (err) setError(err);
+    if (fresh.length > 0)
+      setPicks((prev) => [...prev, ...fresh].slice(0, MAX_IMAGES));
+  }
+
+  function removePick(i: number) {
+    setPicks((prev) => {
+      URL.revokeObjectURL(prev[i].preview);
+      return prev.filter((_, j) => j !== i);
+    });
+  }
 
   const loadThreads = React.useCallback(async () => {
     if (!token) return;
@@ -167,12 +211,20 @@ export function DMs({ target }: { target?: { id: number; username: string } | nu
   }, [token, active, user, loadThreads, loadMessages]);
 
   async function send() {
-    if (!token || busy || !active) return;
+    if (!token || !user || busy || !active) return;
     const text = draft.trim();
-    if (!text) return;
+    if (!text && picks.length === 0) return;
     setBusy(true);
     try {
-      await sendDM(token, { to_user_id: active.with_user_id, text });
+      const keys: string[] = [];
+      for (const p of picks) {
+        const key = `tmp/${user.id}/${crypto.randomUUID()}${extFor(p.file)}`;
+        await uploadImage(token, key, p.file);
+        keys.push(key);
+      }
+      await sendDM(token, { to_user_id: active.with_user_id, text, image_keys: keys });
+      picks.forEach((p) => URL.revokeObjectURL(p.preview));
+      setPicks([]);
       setDraft("");
       setError(null);
       await loadThreads();
@@ -220,7 +272,21 @@ export function DMs({ target }: { target?: { id: number; username: string } | nu
                       : "bg-muted self-start rounded-bl-sm"
                   }`}
                 >
-                  {m.text}
+                  {m.text !== "" && <span>{m.text}</span>}
+                  {(m.images ?? []).length > 0 && (
+                    <span className={`mt-1 grid gap-1 ${(m.images ?? []).length > 1 ? "grid-cols-2" : "grid-cols-1"}`}>
+                      {(m.images ?? []).map((im) => (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          key={im.key}
+                          src={im.url}
+                          alt=""
+                          loading="lazy"
+                          className="max-h-48 w-full rounded-lg object-cover"
+                        />
+                      ))}
+                    </span>
+                  )}
                 </div>
               );
             })}
@@ -232,7 +298,47 @@ export function DMs({ target }: { target?: { id: number; username: string } | nu
             </div>
           </div>
           {error && <p className="text-destructive text-xs">{error}</p>}
+          {picks.length > 0 && (
+            <div className="grid grid-cols-4 gap-2">
+              {picks.map((p, i) => (
+                <div key={p.preview} className="relative">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={p.preview}
+                    alt=""
+                    className="aspect-square w-full rounded-md object-cover"
+                  />
+                  <button
+                    type="button"
+                    aria-label="remove image"
+                    onClick={() => removePick(i)}
+                    className="bg-background absolute top-1 right-1 rounded-full border p-0.5"
+                  >
+                    <X className="size-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           <div className="flex shrink-0 gap-2 border-t pt-2">
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              multiple
+              className="hidden"
+              onChange={(e) => addFiles(e.target.files)}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              aria-label="attach images"
+              onClick={() => fileRef.current?.click()}
+              disabled={picks.length >= MAX_IMAGES}
+            >
+              <ImagePlus className="size-4" />
+            </Button>
             <Input
               placeholder="message…"
               value={draft}
@@ -241,7 +347,7 @@ export function DMs({ target }: { target?: { id: number; username: string } | nu
                 if (e.key === "Enter") send();
               }}
             />
-            <Button type="button" onClick={send} disabled={busy || !draft.trim()}>
+            <Button type="button" onClick={send} disabled={busy || (!draft.trim() && picks.length === 0)}>
               Send
             </Button>
           </div>
